@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Configuración
-HOTSPOT_NAME="LinuxHotspot"
-HOTSPOT_PASS="linux1234"
+HOTSPOT_NAME="Laptop-Anesito"
+HOTSPOT_PASS="12344330000"
 HOTSPOT_CHANNEL="6"
 
 # Colores
@@ -222,7 +222,8 @@ main_menu() {
     echo -e "2. Detener hotspot"
     echo -e "3. Reiniciar hotspot"
     echo -e "4. Ver clientes conectados"
-    echo -e "5. Salir"
+    echo -e "5. Gestión de dispositivos conectados"
+    echo -e "6. Salir"
     echo -n -e "${YELLOW}Selecciona una opción (1-5): ${NC}"
     read option
     
@@ -244,7 +245,10 @@ main_menu() {
         4)
             show_clients
             ;;
-        5)
+        5) 
+            sudo ./gestor-hotspot.sh 
+            ;;
+        6)
             echo -e "${GREEN}Saliendo...${NC}"
             exit 0
             ;;
