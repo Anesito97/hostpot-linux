@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuración
-HOTSPOT_NAME="Laptop-Anesito"
+HOTSPOT_NAME="LaptopAnesito"
 HOTSPOT_PASS="12344330000"
 HOTSPOT_CHANNEL="6"
 
