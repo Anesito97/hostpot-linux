@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Configuración
+# --- Configuración ---
 HOTSPOT_NAME="LaptopAnesito"
 HOTSPOT_PASS="12344330000"
 HOTSPOT_CHANNEL="6"
 
-# Colores
+# --- Colores ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -13,43 +13,84 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Verificar si el script se ejecuta como root
+# --- Variables Globales ---
+SOURCE_IF=""
+WIFI_IF=""
+IP_FORWARD_ORIGINAL=""
+
+# --- Verificación de Root ---
 if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}Este script debe ejecutarse como root${NC}"
+    echo -e "${RED}Este script debe ejecutarse como root.${NC}"
     exit 1
 fi
 
-# Función para obtener la interfaz con internet
+# --- Verificación de Dependencias ---
+check_dependencies() {
+    echo -e "${BLUE}Verificando dependencias...${NC}"
+    local missing=0
+    for cmd in ip iw iptables hostapd dnsmasq; do
+        if ! command -v $cmd &> /dev/null; then
+            echo -e "${RED}✗ Comando no encontrado: $cmd${NC}"
+            missing=1
+        fi
+    done
+    if [ $missing -eq 1 ]; then
+        echo -e "${YELLOW}Por favor, instala los paquetes faltantes. En Ubuntu/Debian:${NC}"
+        echo "sudo apt update && sudo apt install hostapd dnsmasq net-tools iw iproute2 iptables"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Todas las dependencias están instaladas.${NC}"
+}
+
+# --- Función de Limpieza ---
+# Se ejecuta al salir del script para restaurar todo
+cleanup() {
+    echo -e "\n${BLUE}Ejecutando limpieza antes de salir...${NC}"
+    
+    # Detener servicios
+    killall hostapd >/dev/null 2>&1
+    systemctl stop dnsmasq >/dev/null 2>&1
+    
+    # Limpiar iptables solo si las variables están definidas
+    if [ -n "$SOURCE_IF" ] && [ -n "$WIFI_IF" ]; then
+        iptables -t nat -D POSTROUTING -o "$SOURCE_IF" -j MASQUERADE 2>/dev/null
+        iptables -D FORWARD -i "$WIFI_IF" -o "$SOURCE_IF" -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -i "$SOURCE_IF" -o "$WIFI_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    fi
+    
+    # Restaurar ip_forward
+    if [ -n "$IP_FORWARD_ORIGINAL" ]; then
+        echo -e "${YELLOW}Restaurando ip_forward a su estado original ($IP_FORWARD_ORIGINAL)...${NC}"
+        echo "$IP_FORWARD_ORIGINAL" > /proc/sys/net/ipv4/ip_forward
+    fi
+    
+    # Reiniciar la interfaz WiFi a su estado normal
+    if [ -n "$WIFI_IF" ]; then
+        ip addr flush dev "$WIFI_IF" >/dev/null 2>&1
+        ip link set "$WIFI_IF" down >/dev/null 2>&1
+        ip link set "$WIFI_IF" up >/dev/null 2>&1
+    fi
+    
+    # <<< MEJORA CRÍTICA: Reiniciar el servicio de DNS de Ubuntu >>>
+    echo -e "${YELLOW}Reiniciando el servicio DNS del sistema (systemd-resolved)...${NC}"
+    systemctl restart systemd-resolved
+    
+    echo -e "${GREEN}✓ Limpieza completada. El sistema ha sido restaurado.${NC}"
+}
+
+# <<< MEJORA: Atrapar la salida (Ctrl+C) para ejecutar la limpieza >>>
+trap cleanup EXIT
+
+# --- Funciones del Menú ---
+
 get_internet_interface() {
-    # Buscar la interfaz con la ruta por defecto
-    local default_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}')
-    
-    # Verificar si la interfaz tiene conectividad
-    if [ -n "$default_if" ] && ping -c 1 -I $default_if 8.8.8.8 >/dev/null 2>&1; then
-        echo "$default_if"
-    else
-        echo ""
-    fi
+    ip route show default 2>/dev/null | awk '/default/ {print $5}'
 }
 
-# Función para verificar conexión a internet
-check_internet() {
-    echo -e "${BLUE}Verificando conexión a internet...${NC}"
-    
-    if [ -n "$(get_internet_interface)" ]; then
-        echo -e "${GREEN}✓ Hay conexión a internet${NC}"
-        return 0
-    else
-        echo -e "${RED}✗ No se detectó conexión a internet${NC}"
-        return 1
-    fi
-}
-
-# Función para listar interfaces de red
 list_interfaces() {
     local internet_if=$(get_internet_interface)
     echo -e "${BLUE}Interfaces de red disponibles:${NC}"
-    interfaces=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
+    local interfaces=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
     
     for i in "${!interfaces[@]}"; do
         if [ "${interfaces[$i]}" == "$internet_if" ]; then
@@ -59,76 +100,82 @@ list_interfaces() {
         fi
     done
     
-    echo -n -e "${YELLOW}Selecciona el número de la interfaz con internet (1-${#interfaces[@]}): ${NC}"
-    read source_num
+    read -p "Selecciona el número de la interfaz con internet (1-${#interfaces[@]}): " source_num
     
-    if [[ $source_num -lt 1 || $source_num -gt ${#interfaces[@]} ]]; then
-        echo -e "${RED}Selección inválida${NC}"
-        exit 1
+    if [[ ! "$source_num" =~ ^[0-9]+$ ]] || [[ $source_num -lt 1 || $source_num -gt ${#interfaces[@]} ]]; then
+        echo -e "${RED}Selección inválida${NC}"; exit 1
     fi
     
     SOURCE_IF=${interfaces[$((source_num-1))]}
-    echo -e "${GREEN}Interfaz seleccionada: ${SOURCE_IF}${NC}"
+    echo -e "${GREEN}Interfaz con internet seleccionada: ${SOURCE_IF}${NC}"
 }
 
-# Función para seleccionar interfaz WiFi para hotspot
 select_wifi_interface() {
     echo -e "${BLUE}Buscando interfaces WiFi...${NC}"
-    wifi_interfaces=($(iw dev | awk '/Interface/ {print $2}'))
+    local wifi_interfaces=($(iw dev | awk '/Interface/ {print $2}'))
     
     if [ ${#wifi_interfaces[@]} -eq 0 ]; then
-        echo -e "${RED}No se encontraron interfaces WiFi${NC}"
-        exit 1
+        echo -e "${RED}No se encontraron interfaces WiFi.${NC}"; exit 1
     fi
     
-    for i in "${!wifi_interfaces[@]}"; do
-        echo "$((i+1)). ${wifi_interfaces[$i]}"
-    done
+    echo "Interfaces WiFi disponibles:"
+    for i in "${!wifi_interfaces[@]}"; do echo "$((i+1)). ${wifi_interfaces[$i]}"; done
     
-    echo -n -e "${YELLOW}Selecciona el número de la interfaz WiFi para el hotspot (1-${#wifi_interfaces[@]}): ${NC}"
-    read wifi_num
+    read -p "Selecciona el número de la interfaz WiFi para el hotspot (1-${#wifi_interfaces[@]}): " wifi_num
     
-    if [[ $wifi_num -lt 1 || $wifi_num -gt ${#wifi_interfaces[@]} ]]; then
-        echo -e "${RED}Selección inválida${NC}"
-        exit 1
+    if [[ ! "$wifi_num" =~ ^[0-9]+$ ]] || [[ $wifi_num -lt 1 || $wifi_num -gt ${#wifi_interfaces[@]} ]]; then
+        echo -e "${RED}Selección inválida${NC}"; exit 1
     fi
     
     WIFI_IF=${wifi_interfaces[$((wifi_num-1))]}
-    echo -e "${GREEN}Interfaz WiFi seleccionada: ${WIFI_IF}${NC}"
+    echo -e "${GREEN}Interfaz WiFi para hotspot: ${WIFI_IF}${NC}"
 }
 
-# Función para iniciar el hotspot
 start_hotspot() {
+    list_interfaces
+    select_wifi_interface
+
     echo -e "${BLUE}Configurando hotspot...${NC}"
     
-    # Detener servicios que podrían interferir
+    # <<< MEJORA: Detener servicios que interfieren de forma más segura >>>
     systemctl stop hostapd >/dev/null 2>&1
     systemctl stop dnsmasq >/dev/null 2>&1
+    # <<< MEJORA CRÍTICA: Detenemos resolved, pero la función cleanup LO RESTAURARÁ >>>
     systemctl stop systemd-resolved >/dev/null 2>&1
-    
-    # Liberar la dirección IP de la interfaz WiFi
-    dhclient -r $WIFI_IF >/dev/null 2>&1
-    
+
+    # <<< MEJORA: Guardar estado original de ip_forward >>>
+    IP_FORWARD_ORIGINAL=$(cat /proc/sys/net/ipv4/ip_forward)
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+
+    # <<< MEJORA: Limpiar reglas previas de forma más segura >>>
+    iptables -t nat -F
+    iptables -F FORWARD
+
     # Configurar NAT
     echo -e "${YELLOW}Configurando NAT...${NC}"
-    iptables -t nat -F
-    iptables -t nat -A POSTROUTING -o $SOURCE_IF -j MASQUERADE
-    iptables -A FORWARD -i $WIFI_IF -o $SOURCE_IF -j ACCEPT
-    iptables -A FORWARD -i $SOURCE_IF -o $WIFI_IF -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -t nat -A POSTROUTING -o "$SOURCE_IF" -j MASQUERADE
+    iptables -A FORWARD -i "$WIFI_IF" -o "$SOURCE_IF" -j ACCEPT
+    iptables -A FORWARD -i "$SOURCE_IF" -o "$WIFI_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
     
-    # Configurar dnsmasq (con más opciones)
+    # Configurar la IP de la interfaz WiFi
+    echo -e "${YELLOW}Configurando dirección IP para $WIFI_IF...${NC}"
+    ip addr flush dev "$WIFI_IF"
+    ip addr add 192.168.100.1/24 dev "$WIFI_IF"
+    ip link set "$WIFI_IF" up
+
+    # Configurar dnsmasq
     echo -e "${YELLOW}Configurando dnsmasq...${NC}"
     cat > /etc/dnsmasq.conf <<EOF
 interface=$WIFI_IF
-dhcp-range=192.168.100.2,192.168.100.254,255.255.255.0,24h
+dhcp-range=192.168.100.10,192.168.100.100,255.255.255.0,12h
 dhcp-option=3,192.168.100.1
-dhcp-option=6,8.8.8.8,8.8.4.4
+dhcp-option=6,192.168.100.1 # Usar el hotspot como DNS
 server=8.8.8.8
-server=8.8.4.4
+server=1.1.1.1
 no-resolv
 EOF
-    
-    # Configurar hostapd (igual que antes)
+
+    # Configurar hostapd
     echo -e "${YELLOW}Configurando hostapd...${NC}"
     cat > /etc/hostapd.conf <<EOF
 interface=$WIFI_IF
@@ -136,120 +183,75 @@ driver=nl80211
 ssid=$HOTSPOT_NAME
 hw_mode=g
 channel=$HOTSPOT_CHANNEL
-wmm_enabled=0
 macaddr_acl=0
 auth_algs=1
 ignore_broadcast_ssid=0
 wpa=2
 wpa_passphrase=$HOTSPOT_PASS
 wpa_key_mgmt=WPA-PSK
-wpa_pairwise=TKIP
 rsn_pairwise=CCMP
 EOF
     
-    # Asignar dirección IP a la interfaz WiFi
-    echo -e "${YELLOW}Configurando dirección IP...${NC}"
-    ip addr flush dev $WIFI_IF
-    ip addr add 192.168.100.1/24 dev $WIFI_IF
-    ip link set $WIFI_IF up
-    
-    # Iniciar servicios en el orden correcto
+    # Iniciar servicios
     echo -e "${YELLOW}Iniciando servicios...${NC}"
     systemctl restart dnsmasq
-    hostapd -B /etc/hostapd.conf >/dev/null 2>&1
-    
-    # Habilitar el forwarding
-    echo 1 > /proc/sys/net/ipv4/ip_forward
-    
+    hostapd -B /etc/hostapd.conf
+
     echo -e "${GREEN}✓ Hotspot iniciado correctamente${NC}"
-    echo -e "${BLUE}Nombre del hotspot: ${HOTSPOT_NAME}${NC}"
-    echo -e "${BLUE}Contraseña: ${HOTSPOT_PASS}${NC}"
-    
-    # Mostrar información de conexión
-    echo -e "\n${CYAN}Para solucionar problemas:${NC}"
-    echo -e "1. Verifica que $SOURCE_IF tiene internet: ping -c 3 google.com"
-    echo -e "2. Verifica NAT: sudo iptables -t nat -L -n -v"
-    echo -e "3. Prueba DNS: dig @192.168.100.1 google.com"
+    echo -e "${BLUE}Nombre: ${CYAN}$HOTSPOT_NAME${NC}"
+    echo -e "${BLUE}Contraseña: ${CYAN}$HOTSPOT_PASS${NC}"
 }
 
-# Función para detener el hotspot
+# <<< MEJORA: stop_hotspot ahora solo llama a la función de limpieza y sale >>>
 stop_hotspot() {
     echo -e "${BLUE}Deteniendo hotspot...${NC}"
-    
-    # Detener procesos
-    killall hostapd >/dev/null 2>&1
-    systemctl stop dnsmasq >/dev/null 2>&1
-    
-    # Limpiar iptables
-    iptables -t nat -D POSTROUTING -o $SOURCE_IF -j MASQUERADE
-    iptables -D FORWARD -i $WIFI_IF -o $SOURCE_IF -j ACCEPT
-    iptables -D FORWARD -i $SOURCE_IF -o $WIFI_IF -m state --state RELATED,ESTABLISHED -j ACCEPT
-    
-    # Reiniciar interfaz WiFi
-    ip addr flush dev $WIFI_IF
-    ip link set $WIFI_IF down
-    ip link set $WIFI_IF up
-    
-    echo -e "${GREEN}✓ Hotspot detenido correctamente${NC}"
+    exit 0 # El 'trap' se encargará de llamar a cleanup()
 }
 
-# Función para mostrar clientes conectados
 show_clients() {
-    echo -e "${BLUE}Clientes conectados:${NC}"
-    
-    # Intentar varios métodos para mostrar clientes
-    if command -v ip >/dev/null 2>&1; then
-        ip neigh show dev $WIFI_IF | grep -v FAILED
-    elif command -v arp >/dev/null 2>&1; then
-        arp -i $WIFI_IF | grep -v incomplete
-    else
-        echo -e "${RED}No se encontró ni 'ip' ni 'arp' en el sistema${NC}"
-        echo -e "${YELLOW}Instala net-tools o iproute2 para ver los clientes conectados${NC}"
+    if [ -z "$WIFI_IF" ]; then
+        echo -e "${RED}El hotspot no está iniciado. No se puede determinar la interfaz.${NC}"
+        return
     fi
-    
-    # Mostrar también información de dnsmasq leases
-    if [ -f "/var/lib/misc/dnsmasq.leases" ]; then
-        echo -e "\n${BLUE}Direcciones asignadas por dnsmasq:${NC}"
-        cat /var/lib/misc/dnsmasq.leases
-    fi
+    echo -e "${BLUE}Clientes conectados (Interfaz: $WIFI_IF):${NC}"
+    echo -e "${CYAN}--- Leases de Dnsmasq (IP, MAC, Nombre) ---${NC}"
+    cat /var/lib/misc/dnsmasq.leases | awk '{print "IP:", $3, " \tMAC:", $2, "\tNombre:", $4}'
+    echo -e "\n${CYAN}--- Tabla de vecinos (ARP) ---${NC}"
+    ip neigh show dev "$WIFI_IF" | grep -v FAILED
 }
 
 # Menú principal
 main_menu() {
     clear
-    echo -e "${BLUE}=== Menú Hotspot WiFi ===${NC}"
+    check_dependencies
+    echo -e "${BLUE}=== Menú Hotspot WiFi (Mejorado) ===${NC}"
     echo -e "1. Iniciar hotspot"
     echo -e "2. Detener hotspot"
-    echo -e "3. Reiniciar hotspot"
-    echo -e "4. Ver clientes conectados"
-    echo -e "5. Gestión de dispositivos conectados"
-    echo -e "6. Salir"
+    echo -e "3. Ver clientes conectados"
+    echo -e "4. Gestión de dispositivos conectados"
+    echo -e "5. Salir"
     echo -n -e "${YELLOW}Selecciona una opción (1-5): ${NC}"
-    read option
+    read -r option
     
     case $option in
         1)
-            check_internet
-            list_interfaces
-            select_wifi_interface
             start_hotspot
             ;;
         2)
             stop_hotspot
             ;;
         3)
-            stop_hotspot
-            sleep 2
-            start_hotspot
-            ;;
-        4)
             show_clients
             ;;
-        5) 
-            sudo ./gestor-hotspot.sh 
+        4) 
+            if [ -z "$WIFI_IF" ]; then
+                echo -e "${RED}El hotspot debe estar iniciado para gestionar dispositivos.${NC}"
+            else
+                # <<< MEJORA: Pasar la interfaz como argumento >>>
+                ./gestor-hotspot.sh "$WIFI_IF"
+            fi
             ;;
-        6)
-            echo -e "${GREEN}Saliendo...${NC}"
+        5)
             exit 0
             ;;
         *)
@@ -257,6 +259,7 @@ main_menu() {
             ;;
     esac
     
+    echo ""
     read -p "Presiona Enter para continuar..."
     main_menu
 }
